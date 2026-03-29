@@ -25,7 +25,7 @@ MEXC_ACCESS_KEY    = os.environ.get("MEXC_ACCESS_KEY", "mx0vgls2weJIUHs0Xv")
 MEXC_SECRET_KEY    = os.environ.get("MEXC_SECRET_KEY", "bb4d33cadd21491c9ef04e1ddc151796")
 MEXC_BASE          = "https://contract.mexc.com"
 
-SCAN_INTERVAL      = 3600   # 1 hour in seconds
+SCAN_INTERVAL      = 3600   # kept for reference, auto-scan disabled
 TOP_N              = 30     # scan top 30 tokens
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
@@ -477,10 +477,14 @@ def get_account_balance():
         r = mexc_request("GET", "/api/v1/private/account/assets")
         data = r.get("data", [])
         if isinstance(data, list):
+            # Log all currencies for debugging
+            currencies = {a.get("currency"): a.get("availableBalance") for a in data}
+            log.info(f"All MEXC balances: {currencies}")
             usdt = next((a for a in data if str(a.get("currency","")).upper() == "USDT"), None)
             if usdt:
                 return float(usdt.get("availableBalance", 0))
-        log.warning(f"Balance data unexpected format: {data}")
+            log.warning("USDT not found in futures wallet")
+        log.warning(f"Balance data unexpected: {data}")
     except Exception as e:
         log.error(f"Balance error: {e}")
     return 0
@@ -925,9 +929,21 @@ def handle_update(update):
 # ============================================================
 # BOT POLLING LOOP
 # ============================================================
+def clear_old_updates():
+    """Clear queued updates from when bot was offline"""
+    try:
+        updates = tg_get_updates()
+        if updates:
+            last_id = updates[-1]["update_id"]
+            tg_get_updates(offset=last_id + 1)
+            log.info(f"Cleared {len(updates)} old updates")
+    except Exception as e:
+        log.error(f"Clear updates error: {e}")
+
 def polling_loop():
     offset = None
     log.info("Polling loop started")
+    clear_old_updates()  # clear stale updates first
     while bot_state["running"]:
         updates = tg_get_updates(offset)
         for u in updates:
@@ -937,15 +953,6 @@ def polling_loop():
             except Exception as e:
                 log.error(f"Handle update error: {e}")
         time.sleep(1)
-
-def scan_loop():
-    log.info("Scan loop started")
-    while bot_state["running"]:
-        run_scan()
-        for _ in range(SCAN_INTERVAL):
-            if not bot_state["running"]:
-                break
-            time.sleep(1)
 
 def keep_alive_loop():
     """Ping self every 5 minutes to prevent Render from sleeping"""
@@ -1000,8 +1007,7 @@ def start_bot():
         return jsonify({"status": "already running"})
     bot_state["running"] = True
     threading.Thread(target=polling_loop, daemon=True).start()
-    threading.Thread(target=scan_loop, daemon=True).start()
-    tg("🤖 <b>CIPHER BOT STARTED</b>\nType /scan to run now or wait for hourly scan.")
+    tg("🤖 <b>CIPHER BOT STARTED</b>\nType /scan to run a scan.")
     return jsonify({"status": "started"})
 
 @app.route('/stop_bot', methods=['POST'])
@@ -1011,12 +1017,10 @@ def stop_bot():
     return jsonify({"status": "stopped"})
 
 if __name__ == '__main__':
-    # Auto-start bot
     bot_state["running"] = True
     threading.Thread(target=polling_loop, daemon=True).start()
-    threading.Thread(target=scan_loop, daemon=True).start()
     threading.Thread(target=keep_alive_loop, daemon=True).start()
-    tg("🤖 <b>CIPHER BOT ONLINE</b>\n\nType /start for commands.")
+    tg("🤖 <b>CIPHER BOT ONLINE</b>\n\nType /start for commands.\nType /scan to scan for setups.")
     port = int(os.environ.get("PORT", 5001))
     app.run(host='0.0.0.0', port=port, debug=False)
 
