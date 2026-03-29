@@ -424,10 +424,6 @@ Respond ONLY with JSON (no markdown):
 # ============================================================
 # MEXC FUTURES TRADING
 # ============================================================
-def mexc_sign(params):
-    query = "&".join(f"{k}={v}" for k,v in sorted(params.items()))
-    sig = hmac.new(MEXC_SECRET_KEY.encode(), query.encode(), hashlib.sha256).hexdigest()
-    return sig
 
 def mexc_request(method, path, params=None, body=None):
     ts = str(int(time.time() * 1000))
@@ -435,27 +431,32 @@ def mexc_request(method, path, params=None, body=None):
         params = {}
 
     if method == "GET":
-        # GET: sign query string
-        params["timestamp"] = ts
-        sorted_params = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
-        sig = hmac.new(MEXC_SECRET_KEY.encode(), sorted_params.encode(), hashlib.sha256).hexdigest()
-        params["signature"] = sig
+        # Sort params and build query string
+        param_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()) if v is not None and v != "")
+        # MEXC signature: accessKey + timestamp + param_str
+        sign_str = MEXC_ACCESS_KEY + ts + param_str
+        sig = hmac.new(MEXC_SECRET_KEY.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
         headers = {
             "ApiKey": MEXC_ACCESS_KEY,
             "Request-Time": ts,
+            "Signature": sig,
             "Content-Type": "application/json",
         }
         try:
-            r = requests.get(MEXC_BASE + path, params=params, headers=headers, timeout=10)
+            url = MEXC_BASE + path
+            if param_str:
+                url += "?" + param_str
+            r = requests.get(url, headers=headers, timeout=10)
+            log.info(f"MEXC GET {path} status={r.status_code} body={r.text[:200]}")
             return r.json()
         except Exception as e:
             log.error(f"MEXC GET error: {e}")
             return {"error": str(e)}
     else:
-        # POST: sign body
+        # POST: signature is accessKey + timestamp + json body string
         body = body or {}
         body_str = json.dumps(body)
-        sign_str = ts + MEXC_ACCESS_KEY + ts + body_str
+        sign_str = MEXC_ACCESS_KEY + ts + body_str
         sig = hmac.new(MEXC_SECRET_KEY.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
         headers = {
             "ApiKey": MEXC_ACCESS_KEY,
@@ -465,6 +466,7 @@ def mexc_request(method, path, params=None, body=None):
         }
         try:
             r = requests.post(MEXC_BASE + path, json=body, headers=headers, timeout=10)
+            log.info(f"MEXC POST {path} status={r.status_code} body={r.text[:200]}")
             return r.json()
         except Exception as e:
             log.error(f"MEXC POST error: {e}")
@@ -473,16 +475,12 @@ def mexc_request(method, path, params=None, body=None):
 def get_account_balance():
     try:
         r = mexc_request("GET", "/api/v1/private/account/assets")
-        log.info(f"Balance response: {str(r)[:200]}")
-        assets = r.get("data", [])
-        if isinstance(assets, list):
-            usdt = next((a for a in assets if str(a.get("currency","")).upper() == "USDT"), None)
+        data = r.get("data", [])
+        if isinstance(data, list):
+            usdt = next((a for a in data if str(a.get("currency","")).upper() == "USDT"), None)
             if usdt:
                 return float(usdt.get("availableBalance", 0))
-        elif isinstance(assets, dict):
-            # some endpoints return dict with currency as key
-            usdt = assets.get("USDT", {})
-            return float(usdt.get("availableBalance", 0))
+        log.warning(f"Balance data unexpected format: {data}")
     except Exception as e:
         log.error(f"Balance error: {e}")
     return 0
@@ -949,6 +947,22 @@ def scan_loop():
                 break
             time.sleep(1)
 
+def keep_alive_loop():
+    """Ping self every 5 minutes to prevent Render from sleeping"""
+    time.sleep(30)  # wait for server to start
+    render_url = os.environ.get("RENDER_EXTERNAL_URL", "")
+    if not render_url:
+        log.warning("RENDER_EXTERNAL_URL not set — keep-alive disabled")
+        return
+    log.info(f"Keep-alive started, pinging {render_url}/ping every 5 min")
+    while bot_state["running"]:
+        try:
+            requests.get(f"{render_url}/ping", timeout=10)
+            log.info("Keep-alive ping sent")
+        except Exception as e:
+            log.warning(f"Keep-alive ping failed: {e}")
+        time.sleep(300)  # ping every 5 minutes
+
 # ============================================================
 # FLASK ROUTES (position stats for CIPHER web app)
 # ============================================================
@@ -1001,6 +1015,7 @@ if __name__ == '__main__':
     bot_state["running"] = True
     threading.Thread(target=polling_loop, daemon=True).start()
     threading.Thread(target=scan_loop, daemon=True).start()
+    threading.Thread(target=keep_alive_loop, daemon=True).start()
     tg("🤖 <b>CIPHER BOT ONLINE</b>\n\nType /start for commands.")
     port = int(os.environ.get("PORT", 5001))
     app.run(host='0.0.0.0', port=port, debug=False)
