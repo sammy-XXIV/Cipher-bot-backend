@@ -497,75 +497,25 @@ Respond ONLY with JSON (no markdown):
 # ============================================================
 
 # ============================================================
-# HYPERLIQUID TRADING
+# HYPERLIQUID TRADING — using official SDK
 # ============================================================
-def hl_sign(action, nonce, vault=None):
-    """Sign a Hyperliquid action using EIP-712"""
-    from eth_account import Account
-    from eth_account.messages import encode_defunct
-    import eth_abi
+def get_hl_exchange():
+    import eth_account
+    from hyperliquid.exchange import Exchange
+    from hyperliquid.utils import constants
+    wallet = eth_account.Account.from_key(HL_PRIVATE_KEY)
+    return Exchange(wallet, constants.MAINNET_API_URL, account_address=HL_WALLET)
 
-    # Build the action hash
-    action_str = json.dumps(action, separators=(',', ':'), sort_keys=True)
-    payload = f"{nonce}{action_str}"
-    if vault:
-        payload += vault
-
-    msg = encode_defunct(text=payload)
-    signed = Account.sign_message(msg, private_key=HL_PRIVATE_KEY)
-    return {
-        "r": hex(signed.r),
-        "s": hex(signed.s),
-        "v": signed.v,
-    }
-
-def hl_request(action):
-    """Send a signed action to Hyperliquid"""
-    try:
-        from eth_account import Account
-        import struct
-
-        nonce = int(time.time() * 1000)
-
-        # Build message to sign
-        action_bytes = json.dumps(action, separators=(',', ':'), sort_keys=True).encode()
-        nonce_bytes = struct.pack('>Q', nonce)
-        vault_bytes = b'\x00'
-        msg_bytes = action_bytes + nonce_bytes + vault_bytes
-        msg_hash = hashlib.sha256(msg_bytes).digest()
-
-        # Sign using sign_message (works across eth_account versions)
-        from eth_account.messages import encode_defunct
-        msg = encode_defunct(primitive=msg_hash)
-        acct = Account.from_key(HL_PRIVATE_KEY)
-        signed = acct.sign_message(msg)
-
-        payload = {
-            "action": action,
-            "nonce": nonce,
-            "signature": {
-                "r": hex(signed.r),
-                "s": hex(signed.s),
-                "v": signed.v,
-            },
-            "vaultAddress": None,
-        }
-
-        r = requests.post(f"{HL_BASE}/exchange", json=payload, timeout=15)
-        log.info(f"HL exchange status={r.status_code} body={r.text[:300]}")
-        return r.json()
-    except Exception as e:
-        log.error(f"HL request error: {e}")
-        return {"status": "err", "response": str(e)}
+def get_hl_info():
+    from hyperliquid.info import Info
+    from hyperliquid.utils import constants
+    return Info(constants.MAINNET_API_URL, skip_ws=True)
 
 def get_account_balance():
     try:
-        r = requests.post(f"{HL_BASE}/info",
-            json={"type": "clearinghouseState", "user": HL_WALLET},
-            timeout=10)
-        data = r.json()
-        # Hyperliquid uses USDC as collateral
-        balance = float(data.get("marginSummary", {}).get("accountValue", 0))
+        info = get_hl_info()
+        user_state = info.user_state(HL_WALLET)
+        balance = float(user_state.get("marginSummary", {}).get("accountValue", 0))
         log.info(f"HL balance: ${balance} USDC")
         return round(balance, 2)
     except Exception as e:
@@ -574,173 +524,86 @@ def get_account_balance():
 
 def get_position_stats(symbol):
     try:
-        r = requests.post(f"{HL_BASE}/info",
-            json={"type": "clearinghouseState", "user": HL_WALLET},
-            timeout=10)
-        data = r.json()
-        positions = data.get("assetPositions", [])
-        for p in positions:
+        info = get_hl_info()
+        user_state = info.user_state(HL_WALLET)
+        for p in user_state.get("assetPositions", []):
             pos = p.get("position", {})
             if pos.get("coin") == symbol:
                 size = float(pos.get("szi", 0))
-                entry = float(pos.get("entryPx", 0))
-                pnl = float(pos.get("unrealizedPnl", 0))
-                liq = float(pos.get("liquidationPx") or 0)
-                margin = float(pos.get("marginUsed", 0))
-                lev = pos.get("leverage", {}).get("value", "—")
-                margin_type = pos.get("leverage", {}).get("type", "isolated").upper()
                 return {
                     "symbol": symbol,
                     "side": "LONG" if size > 0 else "SHORT",
                     "size": abs(size),
-                    "entry_price": entry,
-                    "liquidation": liq,
-                    "unrealized_pnl": pnl,
-                    "margin": margin,
-                    "leverage": lev,
-                    "margin_type": margin_type,
+                    "entry_price": float(pos.get("entryPx", 0)),
+                    "liquidation": float(pos.get("liquidationPx") or 0),
+                    "unrealized_pnl": float(pos.get("unrealizedPnl", 0)),
+                    "margin": float(pos.get("marginUsed", 0)),
+                    "leverage": pos.get("leverage", {}).get("value", "—"),
+                    "margin_type": pos.get("leverage", {}).get("type", "isolated").upper(),
                 }
     except Exception as e:
         log.error(f"HL position error: {e}")
     return None
 
 def open_position(symbol, side, size, leverage, margin_type, stop_loss, take_profit):
-    """Open a perpetual position on Hyperliquid"""
     try:
+        exchange = get_hl_exchange()
+        info = get_hl_info()
         is_buy = side == "LONG"
-        lev_type = "isolated" if margin_type == "ISOLATED" else "cross"
+        is_cross = margin_type == "CROSS"
+
+        # Check symbol exists on HL perps
+        meta = info.meta()
+        universe = meta.get("universe", [])
+        asset = next((a for a in universe if a["name"] == symbol), None)
+        if not asset:
+            return {"success": False, "error": f"{symbol} not available on Hyperliquid perps"}
 
         # Set leverage
-        lev_action = {
-            "type": "updateLeverage",
-            "asset": symbol,
-            "isCross": lev_type == "cross",
-            "leverage": leverage,
-        }
-        hl_request(lev_action)
+        exchange.update_leverage(leverage, symbol, is_cross=is_cross)
 
-        # Get current price — try multiple sources
+        # Get price
         price = 0
         try:
-            r = requests.post(f"{HL_BASE}/info",
-                json={"type": "allMids"}, timeout=10)
-            mids = r.json()
-            price = float(mids.get(symbol, 0))
+            all_mids = info.all_mids()
+            price = float(all_mids.get(symbol, 0))
         except: pass
-
-        # Fallback to Binance price
         if not price:
-            try:
-                r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT", timeout=5)
-                price = float(r.json().get("price", 0))
-            except: pass
-
-        # Fallback to Bybit price
+            r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT", timeout=5)
+            price = float(r.json().get("price", 0))
         if not price:
-            try:
-                r = requests.get(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}USDT", timeout=5)
-                price = float(r.json()["result"]["list"][0]["lastPrice"])
-            except: pass
+            return {"success": False, "error": "Could not get price"}
 
-        if not price:
-            return {"success": False, "error": "Could not get price from any source"}
+        # Size in coins
+        coin_size = round(size / price, 4)
 
-        # Slippage for market order (1%)
-        limit_px = round(price * (1.01 if is_buy else 0.99), 6)
-
-        # Place market order
-        order_action = {
-            "type": "order",
-            "orders": [{
-                "a": symbol,
-                "b": is_buy,
-                "p": str(limit_px),
-                "s": str(round(size / price, 4)),  # size in coin units
-                "r": False,  # not reduce only
-                "t": {"limit": {"tif": "Ioc"}},  # IOC = immediate or cancel (market-like)
-            }],
-            "grouping": "na",
-        }
-        result = hl_request(order_action)
+        # Market open
+        result = exchange.market_open(symbol, is_buy, coin_size)
+        log.info(f"HL open result: {result}")
 
         if result.get("status") == "ok":
-            order_id = result.get("response", {}).get("data", {}).get("statuses", [{}])[0].get("resting", {}).get("oid")
-            log.info(f"HL order placed: {result}")
-
-            # Set stop loss
-            sl_action = {
-                "type": "order",
-                "orders": [{
-                    "a": symbol,
-                    "b": not is_buy,
-                    "p": str(stop_loss),
-                    "s": str(round(size / price, 4)),
-                    "r": True,  # reduce only
-                    "t": {"trigger": {"isMarket": True, "triggerPx": str(stop_loss), "tpsl": "sl"}},
-                }],
-                "grouping": "na",
-            }
-            hl_request(sl_action)
-
-            # Set take profit
-            tp_action = {
-                "type": "order",
-                "orders": [{
-                    "a": symbol,
-                    "b": not is_buy,
-                    "p": str(take_profit),
-                    "s": str(round(size / price, 4)),
-                    "r": True,
-                    "t": {"trigger": {"isMarket": True, "triggerPx": str(take_profit), "tpsl": "tp"}},
-                }],
-                "grouping": "na",
-            }
-            hl_request(tp_action)
-
-            return {"success": True, "order_id": order_id}
+            # Set TP and SL
+            try:
+                exchange.order(symbol, not is_buy, coin_size, float(stop_loss),
+                    {"trigger": {"triggerPx": str(stop_loss), "isMarket": True, "tpsl": "sl"}},
+                    reduce_only=True)
+                exchange.order(symbol, not is_buy, coin_size, float(take_profit),
+                    {"trigger": {"triggerPx": str(take_profit), "isMarket": True, "tpsl": "tp"}},
+                    reduce_only=True)
+            except Exception as e:
+                log.warning(f"TP/SL failed: {e}")
+            return {"success": True, "order_id": str(result)}
         else:
-            log.error(f"HL order failed: {result}")
             return {"success": False, "error": str(result)}
-
     except Exception as e:
         log.error(f"Open position error: {e}")
         return {"success": False, "error": str(e)}
 
 def close_position(symbol):
     try:
-        pos = get_position_stats(symbol)
-        if not pos:
-            return False
-        is_buy = pos["side"] == "SHORT"  # close opposite direction
-
-        # Get current price
-        price = 0
-        try:
-            r = requests.post(f"{HL_BASE}/info", json={"type": "allMids"}, timeout=10)
-            price = float(r.json().get(symbol, 0))
-        except: pass
-        if not price:
-            try:
-                r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT", timeout=5)
-                price = float(r.json().get("price", 0))
-            except: pass
-        if not price:
-            return False
-        limit_px = round(price * (1.01 if is_buy else 0.99), 6)
-
-        close_action = {
-            "type": "order",
-            "orders": [{
-                "a": symbol,
-                "b": is_buy,
-                "p": str(limit_px),
-                "s": str(pos["size"]),
-                "r": True,
-                "t": {"limit": {"tif": "Ioc"}},
-            }],
-            "grouping": "na",
-        }
-        result = hl_request(close_action)
+        exchange = get_hl_exchange()
+        result = exchange.market_close(symbol)
+        log.info(f"Close result: {result}")
         return result.get("status") == "ok"
     except Exception as e:
         log.error(f"Close position error: {e}")
@@ -1309,4 +1172,3 @@ if __name__ == '__main__':
     tg("🤖 <b>CIPHER BOT ONLINE</b>\n\nType /start for commands.\nType /scan to scan for setups.")
     port = int(os.environ.get("PORT", 5001))
     app.run(host='0.0.0.0', port=port, debug=False)
-
