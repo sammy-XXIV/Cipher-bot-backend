@@ -6,7 +6,7 @@ CIPHER TRADING BOT
 - Picks best setups using Claude AI
 - Sends Telegram notification for approval
 - Asks margin type, % balance, leverage
-- Executes on MEXC Futures
+- Executes on Hyperliquid
 - Monitors position stats
 """
 
@@ -21,12 +21,12 @@ from flask_cors import CORS
 ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "8704846732:AAEWE1hML2blUGlSW6-iYScW5RyQ9YhuUP8")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "7394075113")
-MEXC_ACCESS_KEY    = os.environ.get("MEXC_ACCESS_KEY", "mx0vgls2weJIUHs0Xv")
-MEXC_SECRET_KEY    = os.environ.get("MEXC_SECRET_KEY", "bb4d33cadd21491c9ef04e1ddc151796")
-MEXC_BASE          = "https://contract.mexc.com"
+HL_PRIVATE_KEY     = os.environ.get("HL_PRIVATE_KEY", "0x273257ff92f5fb360a806f8f7010262747ea149cbd7eb8bf5bbca5fdf377075d")
+HL_WALLET          = os.environ.get("HL_WALLET", "0x31ac6c0Dc443A1B3fCc3Cccf0c59F0c57bc36399")
+HL_BASE            = "https://api.hyperliquid.xyz"
 
 SCAN_INTERVAL      = 3600   # kept for reference, auto-scan disabled
-TOP_N              = 30     # scan top 30 tokens
+TOP_N              = 30
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s %(levelname)s %(message)s')
 log = logging.getLogger("CIPHER-BOT")
@@ -425,156 +425,223 @@ Respond ONLY with JSON (no markdown):
 # MEXC FUTURES TRADING
 # ============================================================
 
-def mexc_request(method, path, params=None, body=None):
-    ts = str(int(time.time() * 1000))
-    if params is None:
-        params = {}
+# ============================================================
+# HYPERLIQUID TRADING
+# ============================================================
+def hl_sign(action, nonce, vault=None):
+    """Sign a Hyperliquid action using EIP-712"""
+    from eth_account import Account
+    from eth_account.messages import encode_defunct
+    import eth_abi
 
-    if method == "GET":
-        # Sort params and build query string
-        param_str = "&".join(f"{k}={v}" for k, v in sorted(params.items()) if v is not None and v != "")
-        # MEXC signature: accessKey + timestamp + param_str
-        sign_str = MEXC_ACCESS_KEY + ts + param_str
-        sig = hmac.new(MEXC_SECRET_KEY.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
-        headers = {
-            "ApiKey": MEXC_ACCESS_KEY,
-            "Request-Time": ts,
-            "Signature": sig,
-            "Content-Type": "application/json",
+    # Build the action hash
+    action_str = json.dumps(action, separators=(',', ':'), sort_keys=True)
+    payload = f"{nonce}{action_str}"
+    if vault:
+        payload += vault
+
+    msg = encode_defunct(text=payload)
+    signed = Account.sign_message(msg, private_key=HL_PRIVATE_KEY)
+    return {
+        "r": hex(signed.r),
+        "s": hex(signed.s),
+        "v": signed.v,
+    }
+
+def hl_request(action):
+    """Send a signed action to Hyperliquid"""
+    try:
+        from eth_account import Account
+        from eth_account.messages import encode_typed_data
+        import struct
+
+        nonce = int(time.time() * 1000)
+
+        # Hash the action
+        action_bytes = json.dumps(action, separators=(',', ':'), sort_keys=True).encode()
+        nonce_bytes = struct.pack('>Q', nonce)
+        vault_bytes = b'\x00'  # no vault
+
+        msg_bytes = action_bytes + nonce_bytes + vault_bytes
+        msg_hash = hashlib.sha256(msg_bytes).digest()
+
+        # Sign with eth_account
+        acct = Account.from_key(HL_PRIVATE_KEY)
+        sig = acct.signHash(msg_hash)
+
+        payload = {
+            "action": action,
+            "nonce": nonce,
+            "signature": {
+                "r": hex(sig.r),
+                "s": hex(sig.s),
+                "v": sig.v,
+            },
+            "vaultAddress": None,
         }
-        try:
-            url = MEXC_BASE + path
-            if param_str:
-                url += "?" + param_str
-            r = requests.get(url, headers=headers, timeout=10)
-            log.info(f"MEXC GET {path} status={r.status_code} body={r.text[:200]}")
-            return r.json()
-        except Exception as e:
-            log.error(f"MEXC GET error: {e}")
-            return {"error": str(e)}
-    else:
-        # POST: signature is accessKey + timestamp + json body string
-        body = body or {}
-        body_str = json.dumps(body)
-        sign_str = MEXC_ACCESS_KEY + ts + body_str
-        sig = hmac.new(MEXC_SECRET_KEY.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
-        headers = {
-            "ApiKey": MEXC_ACCESS_KEY,
-            "Request-Time": ts,
-            "Signature": sig,
-            "Content-Type": "application/json",
-        }
-        try:
-            r = requests.post(MEXC_BASE + path, json=body, headers=headers, timeout=10)
-            log.info(f"MEXC POST {path} status={r.status_code} body={r.text[:200]}")
-            return r.json()
-        except Exception as e:
-            log.error(f"MEXC POST error: {e}")
-            return {"error": str(e)}
+
+        r = requests.post(f"{HL_BASE}/exchange", json=payload, timeout=15)
+        log.info(f"HL exchange status={r.status_code} body={r.text[:300]}")
+        return r.json()
+    except Exception as e:
+        log.error(f"HL request error: {e}")
+        return {"status": "err", "response": str(e)}
 
 def get_account_balance():
     try:
-        r = mexc_request("GET", "/api/v1/private/account/assets")
-        data = r.get("data", [])
-        if isinstance(data, list):
-            # Log all currencies for debugging
-            currencies = {a.get("currency"): a.get("availableBalance") for a in data}
-            log.info(f"All MEXC balances: {currencies}")
-            usdt = next((a for a in data if str(a.get("currency","")).upper() == "USDT"), None)
-            if usdt:
-                return float(usdt.get("availableBalance", 0))
-            log.warning("USDT not found in futures wallet")
-        log.warning(f"Balance data unexpected: {data}")
+        r = requests.post(f"{HL_BASE}/info",
+            json={"type": "clearinghouseState", "user": HL_WALLET},
+            timeout=10)
+        data = r.json()
+        balance = float(data.get("marginSummary", {}).get("accountValue", 0))
+        log.info(f"HL balance: ${balance}")
+        return balance
     except Exception as e:
-        log.error(f"Balance error: {e}")
-    return 0
+        log.error(f"HL balance error: {e}")
+        return 0
 
 def get_position_stats(symbol):
     try:
-        r = mexc_request("GET", "/api/v1/private/position/open_positions", {"symbol": f"{symbol}_USDT"})
-        positions = r.get("data", [])
-        if positions:
-            p = positions[0]
-            return {
-                "symbol": symbol,
-                "side": p.get("positionType",""),
-                "size": p.get("holdVol",""),
-                "entry_price": p.get("openAvgPrice",""),
-                "liquidation": p.get("liquidatePrice",""),
-                "unrealized_pnl": p.get("unrealisedPnl",""),
-                "margin": p.get("im",""),
-                "leverage": p.get("leverage",""),
-                "margin_type": "CROSS" if p.get("autoAddIm") else "ISOLATED",
-            }
+        r = requests.post(f"{HL_BASE}/info",
+            json={"type": "clearinghouseState", "user": HL_WALLET},
+            timeout=10)
+        data = r.json()
+        positions = data.get("assetPositions", [])
+        for p in positions:
+            pos = p.get("position", {})
+            if pos.get("coin") == symbol:
+                size = float(pos.get("szi", 0))
+                entry = float(pos.get("entryPx", 0))
+                pnl = float(pos.get("unrealizedPnl", 0))
+                liq = float(pos.get("liquidationPx") or 0)
+                margin = float(pos.get("marginUsed", 0))
+                lev = pos.get("leverage", {}).get("value", "—")
+                margin_type = pos.get("leverage", {}).get("type", "isolated").upper()
+                return {
+                    "symbol": symbol,
+                    "side": "LONG" if size > 0 else "SHORT",
+                    "size": abs(size),
+                    "entry_price": entry,
+                    "liquidation": liq,
+                    "unrealized_pnl": pnl,
+                    "margin": margin,
+                    "leverage": lev,
+                    "margin_type": margin_type,
+                }
     except Exception as e:
-        log.error(f"Position error: {e}")
+        log.error(f"HL position error: {e}")
     return None
 
 def open_position(symbol, side, size, leverage, margin_type, stop_loss, take_profit):
-    """Open a futures position on MEXC"""
+    """Open a perpetual position on Hyperliquid"""
     try:
-        # Set leverage
-        mexc_request("POST", "/api/v1/private/position/change_leverage", body={
-            "symbol": f"{symbol}_USDT",
-            "leverage": leverage,
-            "openType": 1 if margin_type=="ISOLATED" else 2,
-            "positionType": 1 if side=="LONG" else 2,
-        })
+        is_buy = side == "LONG"
+        lev_type = "isolated" if margin_type == "ISOLATED" else "cross"
 
-        # Place order
-        order_side = 1 if side == "LONG" else 3  # 1=open long, 3=open short
-        body = {
-            "symbol": f"{symbol}_USDT",
-            "side": order_side,
-            "orderType": 5,  # market order
-            "vol": size,
-            "openType": 1 if margin_type=="ISOLATED" else 2,
+        # Set leverage
+        lev_action = {
+            "type": "updateLeverage",
+            "asset": symbol,
+            "isCross": lev_type == "cross",
             "leverage": leverage,
         }
-        r = mexc_request("POST", "/api/v1/private/order/submit", body=body)
-        order_id = r.get("data")
+        hl_request(lev_action)
 
-        if order_id:
+        # Get current price for market order
+        r = requests.post(f"{HL_BASE}/info",
+            json={"type": "allMids"}, timeout=10)
+        mids = r.json()
+        price = float(mids.get(symbol, 0))
+        if not price:
+            return {"success": False, "error": "Could not get price"}
+
+        # Slippage for market order (1%)
+        limit_px = round(price * (1.01 if is_buy else 0.99), 6)
+
+        # Place market order
+        order_action = {
+            "type": "order",
+            "orders": [{
+                "a": symbol,
+                "b": is_buy,
+                "p": str(limit_px),
+                "s": str(round(size / price, 4)),  # size in coin units
+                "r": False,  # not reduce only
+                "t": {"limit": {"tif": "Ioc"}},  # IOC = immediate or cancel (market-like)
+            }],
+            "grouping": "na",
+        }
+        result = hl_request(order_action)
+
+        if result.get("status") == "ok":
+            order_id = result.get("response", {}).get("data", {}).get("statuses", [{}])[0].get("resting", {}).get("oid")
+            log.info(f"HL order placed: {result}")
+
             # Set stop loss
-            mexc_request("POST", "/api/v1/private/planorder/place", body={
-                "symbol": f"{symbol}_USDT",
-                "side": 2 if side=="LONG" else 4,  # close direction
-                "orderType": 3,  # stop market
-                "triggerPrice": stop_loss,
-                "vol": size,
-                "triggerType": 2,
-                "executeCycle": 87600,
-            })
+            sl_action = {
+                "type": "order",
+                "orders": [{
+                    "a": symbol,
+                    "b": not is_buy,
+                    "p": str(stop_loss),
+                    "s": str(round(size / price, 4)),
+                    "r": True,  # reduce only
+                    "t": {"trigger": {"isMarket": True, "triggerPx": str(stop_loss), "tpsl": "sl"}},
+                }],
+                "grouping": "na",
+            }
+            hl_request(sl_action)
+
             # Set take profit
-            mexc_request("POST", "/api/v1/private/planorder/place", body={
-                "symbol": f"{symbol}_USDT",
-                "side": 2 if side=="LONG" else 4,
-                "orderType": 3,
-                "triggerPrice": take_profit,
-                "vol": size,
-                "triggerType": 1,
-                "executeCycle": 87600,
-            })
+            tp_action = {
+                "type": "order",
+                "orders": [{
+                    "a": symbol,
+                    "b": not is_buy,
+                    "p": str(take_profit),
+                    "s": str(round(size / price, 4)),
+                    "r": True,
+                    "t": {"trigger": {"isMarket": True, "triggerPx": str(take_profit), "tpsl": "tp"}},
+                }],
+                "grouping": "na",
+            }
+            hl_request(tp_action)
+
             return {"success": True, "order_id": order_id}
+        else:
+            log.error(f"HL order failed: {result}")
+            return {"success": False, "error": str(result)}
 
     except Exception as e:
         log.error(f"Open position error: {e}")
-    return {"success": False}
+        return {"success": False, "error": str(e)}
 
 def close_position(symbol):
     try:
         pos = get_position_stats(symbol)
         if not pos:
             return False
-        side = 2 if "LONG" in str(pos["side"]) else 4
-        mexc_request("POST", "/api/v1/private/order/submit", body={
-            "symbol": f"{symbol}_USDT",
-            "side": side,
-            "orderType": 5,
-            "vol": pos["size"],
-            "openType": 1,
-        })
-        return True
+        is_buy = pos["side"] == "SHORT"  # close opposite direction
+
+        # Get current price
+        r = requests.post(f"{HL_BASE}/info", json={"type": "allMids"}, timeout=10)
+        price = float(r.json().get(symbol, 0))
+        limit_px = round(price * (1.01 if is_buy else 0.99), 6)
+
+        close_action = {
+            "type": "order",
+            "orders": [{
+                "a": symbol,
+                "b": is_buy,
+                "p": str(limit_px),
+                "s": str(pos["size"]),
+                "r": True,
+                "t": {"limit": {"tif": "Ioc"}},
+            }],
+            "grouping": "na",
+        }
+        result = hl_request(close_action)
+        return result.get("status") == "ok"
     except Exception as e:
         log.error(f"Close position error: {e}")
         return False
@@ -775,7 +842,7 @@ def handle_update(update):
             trade = bot_state["pending_trade"]
             setup = bot_state["setup"]
             signal = trade["signal"]
-            tg(f"⚡ Executing <b>{trade['symbol']}</b> {signal['signal']} on MEXC...")
+            tg(f"⚡ Executing <b>{trade['symbol']}</b> {signal['signal']} on Hyperliquid...")
 
             result = open_position(
                 symbol=trade["symbol"],
@@ -809,7 +876,7 @@ def handle_update(update):
                     f"Type /stats to monitor your position."
                 )
             else:
-                tg("❌ <b>Order failed.</b> Check MEXC account and try again.")
+                tg("❌ <b>Order failed.</b> Check Hyperliquid account and try again.")
 
             bot_state["pending_trade"] = None
             bot_state["waiting_for"] = None
@@ -836,7 +903,7 @@ def handle_update(update):
                 "/stats — View open position\n"
                 "/close — Close active position\n"
                 "/history — Trade history\n"
-                "/balance — Check MEXC balance\n"
+                "/balance — Check Hyperliquid balance\n"
                 "/stop — Stop bot\n"
             )
 
@@ -893,7 +960,7 @@ def handle_update(update):
 
         elif text == "/balance":
             bal = get_account_balance()
-            tg(f"💰 MEXC Futures Balance: <b>${bal:.2f} USDT</b>")
+            tg(f"💰 Hyperliquid Balance: <b>${bal:.2f} USDT</b>")
 
         elif text == "/history":
             history = bot_state.get("trade_history", [])
@@ -920,7 +987,7 @@ def handle_update(update):
                 tg(f"✅ <b>{pos['symbol']}</b> position closed.")
                 bot_state["active_position"] = None
             else:
-                tg("❌ Failed to close position. Check MEXC manually.")
+                tg("❌ Failed to close position. Check Hyperliquid manually.")
             bot_state["waiting_for"] = None
         elif data == "close_no" and bot_state["waiting_for"] == "close_confirm":
             bot_state["waiting_for"] = None
