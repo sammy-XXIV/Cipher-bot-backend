@@ -619,13 +619,31 @@ def open_position(symbol, side, size, leverage, margin_type, stop_loss, take_pro
         }
         hl_request(lev_action)
 
-        # Get current price for market order
-        r = requests.post(f"{HL_BASE}/info",
-            json={"type": "allMids"}, timeout=10)
-        mids = r.json()
-        price = float(mids.get(symbol, 0))
+        # Get current price — try multiple sources
+        price = 0
+        try:
+            r = requests.post(f"{HL_BASE}/info",
+                json={"type": "allMids"}, timeout=10)
+            mids = r.json()
+            price = float(mids.get(symbol, 0))
+        except: pass
+
+        # Fallback to Binance price
         if not price:
-            return {"success": False, "error": "Could not get price"}
+            try:
+                r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT", timeout=5)
+                price = float(r.json().get("price", 0))
+            except: pass
+
+        # Fallback to Bybit price
+        if not price:
+            try:
+                r = requests.get(f"https://api.bybit.com/v5/market/tickers?category=linear&symbol={symbol}USDT", timeout=5)
+                price = float(r.json()["result"]["list"][0]["lastPrice"])
+            except: pass
+
+        if not price:
+            return {"success": False, "error": "Could not get price from any source"}
 
         # Slippage for market order (1%)
         limit_px = round(price * (1.01 if is_buy else 0.99), 6)
@@ -696,8 +714,18 @@ def close_position(symbol):
         is_buy = pos["side"] == "SHORT"  # close opposite direction
 
         # Get current price
-        r = requests.post(f"{HL_BASE}/info", json={"type": "allMids"}, timeout=10)
-        price = float(r.json().get(symbol, 0))
+        price = 0
+        try:
+            r = requests.post(f"{HL_BASE}/info", json={"type": "allMids"}, timeout=10)
+            price = float(r.json().get(symbol, 0))
+        except: pass
+        if not price:
+            try:
+                r = requests.get(f"https://api.binance.com/api/v3/ticker/price?symbol={symbol}USDT", timeout=5)
+                price = float(r.json().get("price", 0))
+            except: pass
+        if not price:
+            return False
         limit_px = round(price * (1.01 if is_buy else 0.99), 6)
 
         close_action = {
