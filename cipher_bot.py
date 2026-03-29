@@ -523,30 +523,30 @@ def hl_request(action):
     """Send a signed action to Hyperliquid"""
     try:
         from eth_account import Account
-        from eth_account.messages import encode_typed_data
         import struct
 
         nonce = int(time.time() * 1000)
 
-        # Hash the action
+        # Build message to sign
         action_bytes = json.dumps(action, separators=(',', ':'), sort_keys=True).encode()
         nonce_bytes = struct.pack('>Q', nonce)
-        vault_bytes = b'\x00'  # no vault
-
+        vault_bytes = b'\x00'
         msg_bytes = action_bytes + nonce_bytes + vault_bytes
         msg_hash = hashlib.sha256(msg_bytes).digest()
 
-        # Sign with eth_account
+        # Sign using sign_message (works across eth_account versions)
+        from eth_account.messages import encode_defunct
+        msg = encode_defunct(primitive=msg_hash)
         acct = Account.from_key(HL_PRIVATE_KEY)
-        sig = acct.signHash(msg_hash)
+        signed = acct.sign_message(msg)
 
         payload = {
             "action": action,
             "nonce": nonce,
             "signature": {
-                "r": hex(sig.r),
-                "s": hex(sig.s),
-                "v": sig.v,
+                "r": hex(signed.r),
+                "s": hex(signed.s),
+                "v": signed.v,
             },
             "vaultAddress": None,
         }
