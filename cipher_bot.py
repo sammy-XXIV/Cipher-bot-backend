@@ -493,9 +493,10 @@ def get_account_balance():
             json={"type": "clearinghouseState", "user": HL_WALLET},
             timeout=10)
         data = r.json()
+        # Hyperliquid uses USDC as collateral
         balance = float(data.get("marginSummary", {}).get("accountValue", 0))
-        log.info(f"HL balance: ${balance}")
-        return balance
+        log.info(f"HL balance: ${balance} USDC")
+        return round(balance, 2)
     except Exception as e:
         log.error(f"HL balance error: {e}")
         return 0
@@ -798,7 +799,10 @@ def handle_update(update):
 
         elif data.startswith("lev_") and bot_state["waiting_for"] == "leverage":
             bot_state["setup"]["leverage"] = int(data.replace("lev_",""))
-            # Fetch balance and show summary
+            bot_state["waiting_for"] = "confirm"  # set state immediately before balance fetch
+            tg("⏳ Fetching your balance...")
+
+            # Fetch balance
             balance = get_account_balance()
             pct = bot_state["setup"]["pct"]
             lev = bot_state["setup"]["leverage"]
@@ -814,8 +818,8 @@ def handle_update(update):
                 f"📋 <b>TRADE SUMMARY</b>\n\n"
                 f"Token: <b>{trade['symbol']}</b>\n"
                 f"Signal: <b>{signal['signal']}</b> ({signal.get('confidence')}% confidence)\n\n"
-                f"💰 Wallet Balance: <b>${balance}</b>\n"
-                f"📊 Margin Used: <b>${margin_used}</b> ({pct}%)\n"
+                f"💰 Wallet Balance: <b>${balance} USDC</b>\n"
+                f"📊 Margin Used: <b>${margin_used} USDC</b> ({pct}%)\n"
                 f"⚡ Leverage: <b>{lev}x</b>\n"
                 f"📦 Position Size: <b>${position_size}</b> notional\n"
                 f"🔐 Margin Type: <b>{margin}</b>\n"
@@ -831,7 +835,6 @@ def handle_update(update):
             bot_state["setup"]["balance"] = balance
             bot_state["setup"]["margin_used"] = margin_used
             bot_state["setup"]["position_size"] = position_size
-            bot_state["waiting_for"] = "confirm"
 
             tg(summary, [[
                 {"text": "✅ CONFIRM TRADE", "callback_data": "confirm_yes"},
@@ -896,7 +899,7 @@ def handle_update(update):
         if text == "/start":
             tg(
                 "🤖 <b>CIPHER TRADING BOT</b>\n\n"
-                "I scan top 30 tokens every hour and find the best trading setups.\n\n"
+                "I scan top 30 tokens and find the best trading setups.\n\n"
                 "Commands:\n"
                 "/scan — Run scan now\n"
                 "/timeframe — Change scan timeframe\n"
@@ -960,7 +963,7 @@ def handle_update(update):
 
         elif text == "/balance":
             bal = get_account_balance()
-            tg(f"💰 Hyperliquid Balance: <b>${bal:.2f} USDT</b>")
+            tg(f"💰 Hyperliquid Balance: <b>${bal:.2f} USDC</b>")
 
         elif text == "/history":
             history = bot_state.get("trade_history", [])
@@ -997,20 +1000,34 @@ def handle_update(update):
 # BOT POLLING LOOP
 # ============================================================
 def clear_old_updates():
-    """Clear queued updates from when bot was offline"""
+    """Clear ALL pending updates on startup"""
     try:
-        updates = tg_get_updates()
+        # Get updates with -1 offset to clear everything
+        r = requests.get(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+            params={"offset": -1, "timeout": 0},
+            timeout=10
+        )
+        updates = r.json().get("result", [])
         if updates:
             last_id = updates[-1]["update_id"]
-            tg_get_updates(offset=last_id + 1)
-            log.info(f"Cleared {len(updates)} old updates")
+            # Confirm clear by fetching with last_id + 1
+            requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params={"offset": last_id + 1, "timeout": 0},
+                timeout=10
+            )
+            log.info(f"Cleared updates up to {last_id}")
+            return last_id + 1
+        return None
     except Exception as e:
         log.error(f"Clear updates error: {e}")
+        return None
 
 def polling_loop():
-    offset = None
     log.info("Polling loop started")
-    clear_old_updates()  # clear stale updates first
+    offset = clear_old_updates()  # clear stale updates and get starting offset
+    log.info(f"Starting polling from offset: {offset}")
     while bot_state["running"]:
         updates = tg_get_updates(offset)
         for u in updates:
