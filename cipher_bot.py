@@ -22,7 +22,7 @@ ANTHROPIC_API_KEY  = os.environ.get("ANTHROPIC_API_KEY", "")
 TELEGRAM_TOKEN     = os.environ.get("TELEGRAM_TOKEN", "8704846732:AAEWE1hML2blUGlSW6-iYScW5RyQ9YhuUP8")
 TELEGRAM_CHAT_ID   = os.environ.get("TELEGRAM_CHAT_ID", "7394075113")
 HL_PRIVATE_KEY     = os.environ.get("HL_PRIVATE_KEY", "0x273257ff92f5fb360a806f8f7010262747ea149cbd7eb8bf5bbca5fdf377075d")
-HL_WALLET          = os.environ.get("HL_WALLET", "0x31ac6c0Dc443A1B3fCc3Cccf0c59F0c57bc36399")
+HL_WALLET          = os.environ.get("HL_WALLET", "0x6d08320ee7f76eaa2ce41c86f2aa3cfb7056ace9")
 HL_BASE            = "https://api.hyperliquid.xyz"
 
 SCAN_INTERVAL      = 3600   # kept for reference, auto-scan disabled
@@ -75,6 +75,26 @@ def tg(text, buttons=None):
     except Exception as e:
         log.error(f"TG error: {e}")
         return None
+
+def tg_edit(message_id, text, buttons=None):
+    """Edit an existing message"""
+    payload = {
+        "chat_id": TELEGRAM_CHAT_ID,
+        "message_id": message_id,
+        "text": text,
+        "parse_mode": "HTML",
+    }
+    if buttons:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": buttons})
+    else:
+        payload["reply_markup"] = json.dumps({"inline_keyboard": []})
+    try:
+        requests.post(
+            f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/editMessageText",
+            json=payload, timeout=10
+        )
+    except Exception as e:
+        log.error(f"TG edit error: {e}")
 
 def tg_get_updates(offset=None):
     try:
@@ -137,7 +157,6 @@ def register_commands():
         {"command": "stats",     "description": "View open position stats"},
         {"command": "close",     "description": "Close active position"},
         {"command": "history",   "description": "View trade history"},
-        {"command": "stop",      "description": "Stop the bot"},
     ]
     try:
         requests.post(
@@ -809,94 +828,184 @@ def handle_update(update):
             result = next((r for r in bot_state["scan_results"] if r["symbol"]==symbol), None)
             if result:
                 bot_state["pending_trade"] = result
-                bot_state["setup"] = {"step_msgs": []}
+                bot_state["setup"] = {"step": "margin_type"}
                 bot_state["waiting_for"] = "margin_type"
+                # Send ONE message — will be edited through all steps
                 mid = tg_send_get_id(
-                    f"✅ Selected <b>{symbol}</b>\n\nStep 1️⃣ — Choose margin type:",
+                    f"🔧 <b>TRADE SETUP — {symbol}</b>\n\n"
+                    f"Signal: <b>{result['signal']['signal']}</b> ({result['signal'].get('confidence')}% confidence)\n\n"
+                    f"Step 1️⃣ — Choose margin type:",
                     [[
                         {"text": "🔒 ISOLATED (safer)", "callback_data": "margin_isolated"},
                         {"text": "🔓 CROSS", "callback_data": "margin_cross"},
+                    ],[
+                        {"text": "❌ Cancel", "callback_data": "confirm_no"},
                     ]]
                 )
-                if mid: bot_state["setup"]["step_msgs"].append(mid)
+                bot_state["setup"]["flow_msg_id"] = mid
 
         elif data in ["margin_isolated","margin_cross"] and bot_state["waiting_for"] == "margin_type":
             bot_state["setup"]["margin"] = "ISOLATED" if data=="margin_isolated" else "CROSS"
             bot_state["waiting_for"] = "balance_pct"
-            mid = tg_send_get_id(
-                f"✅ Margin: <b>{bot_state['setup']['margin']}</b>\n\nStep 2️⃣ — How much % of your balance to use?",
+            trade = bot_state["pending_trade"]
+            symbol = trade["symbol"]
+            margin = bot_state["setup"]["margin"]
+            tg_edit(
+                bot_state["setup"]["flow_msg_id"],
+                f"🔧 <b>TRADE SETUP — {symbol}</b>\n\n"
+                f"✅ Margin: <b>{margin}</b>\n\n"
+                f"Step 2️⃣ — How much % of your balance to use?",
                 [[
                     {"text": "10%", "callback_data": "pct_10"},
                     {"text": "20%", "callback_data": "pct_20"},
                     {"text": "30%", "callback_data": "pct_30"},
                     {"text": "50%", "callback_data": "pct_50"},
+                ],[
+                    {"text": "◀ Back", "callback_data": "back_margin"},
+                    {"text": "❌ Cancel", "callback_data": "confirm_no"},
                 ]]
             )
-            if mid: bot_state["setup"]["step_msgs"].append(mid)
+
+        elif data == "back_margin" and bot_state["waiting_for"] == "balance_pct":
+            bot_state["waiting_for"] = "margin_type"
+            trade = bot_state["pending_trade"]
+            tg_edit(
+                bot_state["setup"]["flow_msg_id"],
+                f"🔧 <b>TRADE SETUP — {trade['symbol']}</b>\n\n"
+                f"Signal: <b>{trade['signal']['signal']}</b> ({trade['signal'].get('confidence')}% confidence)\n\n"
+                f"Step 1️⃣ — Choose margin type:",
+                [[
+                    {"text": "🔒 ISOLATED (safer)", "callback_data": "margin_isolated"},
+                    {"text": "🔓 CROSS", "callback_data": "margin_cross"},
+                ],[
+                    {"text": "❌ Cancel", "callback_data": "confirm_no"},
+                ]]
+            )
 
         elif data.startswith("pct_") and bot_state["waiting_for"] == "balance_pct":
             bot_state["setup"]["pct"] = int(data.replace("pct_",""))
             bot_state["waiting_for"] = "leverage"
-            mid = tg_send_get_id(
-                f"✅ Balance usage: <b>{bot_state['setup']['pct']}%</b>\n\nStep 3️⃣ — Choose leverage:",
+            trade = bot_state["pending_trade"]
+            symbol = trade["symbol"]
+            margin = bot_state["setup"]["margin"]
+            pct = bot_state["setup"]["pct"]
+            tg_edit(
+                bot_state["setup"]["flow_msg_id"],
+                f"🔧 <b>TRADE SETUP — {symbol}</b>\n\n"
+                f"✅ Margin: <b>{margin}</b>\n"
+                f"✅ Balance: <b>{pct}%</b>\n\n"
+                f"Step 3️⃣ — Choose leverage:",
                 [[
                     {"text": "5x",  "callback_data": "lev_5"},
                     {"text": "10x", "callback_data": "lev_10"},
                     {"text": "20x", "callback_data": "lev_20"},
                     {"text": "50x", "callback_data": "lev_50"},
+                ],[
+                    {"text": "◀ Back", "callback_data": "back_pct"},
+                    {"text": "❌ Cancel", "callback_data": "confirm_no"},
                 ]]
             )
-            if mid: bot_state["setup"]["step_msgs"].append(mid)
+
+        elif data == "back_pct" and bot_state["waiting_for"] == "leverage":
+            bot_state["waiting_for"] = "balance_pct"
+            trade = bot_state["pending_trade"]
+            margin = bot_state["setup"]["margin"]
+            tg_edit(
+                bot_state["setup"]["flow_msg_id"],
+                f"🔧 <b>TRADE SETUP — {trade['symbol']}</b>\n\n"
+                f"✅ Margin: <b>{margin}</b>\n\n"
+                f"Step 2️⃣ — How much % of your balance to use?",
+                [[
+                    {"text": "10%", "callback_data": "pct_10"},
+                    {"text": "20%", "callback_data": "pct_20"},
+                    {"text": "30%", "callback_data": "pct_30"},
+                    {"text": "50%", "callback_data": "pct_50"},
+                ],[
+                    {"text": "◀ Back", "callback_data": "back_margin"},
+                    {"text": "❌ Cancel", "callback_data": "confirm_no"},
+                ]]
+            )
 
         elif data.startswith("lev_") and bot_state["waiting_for"] == "leverage":
             bot_state["setup"]["leverage"] = int(data.replace("lev_",""))
             bot_state["waiting_for"] = "confirm"
-            mid = tg_send_get_id("⏳ Fetching your balance...")
-            if mid: bot_state["setup"]["step_msgs"].append(mid)
-
-            balance = get_account_balance()
-            pct = bot_state["setup"]["pct"]
-            lev = bot_state["setup"]["leverage"]
-            margin = bot_state["setup"]["margin"]
             trade = bot_state["pending_trade"]
             signal = trade["signal"]
+            symbol = trade["symbol"]
+            margin = bot_state["setup"]["margin"]
+            pct = bot_state["setup"]["pct"]
+            lev = bot_state["setup"]["leverage"]
 
-            margin_used = round(balance * pct / 100, 2)
-            position_size = round(margin_used * lev, 2)
-            liq_pct = round((margin_used / position_size) * 100, 2) if margin=="ISOLATED" else round((balance / position_size) * 100, 2)
+            # Show loading in same message
+            tg_edit(bot_state["setup"]["flow_msg_id"],
+                f"🔧 <b>TRADE SETUP — {symbol}</b>\n\n⏳ Fetching balance...")
 
-            summary = (
-                f"📋 <b>TRADE SUMMARY</b>\n\n"
-                f"Token: <b>{trade['symbol']}</b>\n"
-                f"Signal: <b>{signal['signal']}</b> ({signal.get('confidence')}% confidence)\n\n"
-                f"💰 Balance: <b>${balance} USDC</b>\n"
-                f"📊 Margin: <b>${margin_used} USDC</b> ({pct}%)\n"
-                f"⚡ Leverage: <b>{lev}x</b>\n"
-                f"📦 Notional: <b>${position_size}</b>\n"
-                f"🔐 Margin Type: <b>{margin}</b>\n"
-                f"⚠️ Liquidation at: <b>{liq_pct}% move against you</b>\n\n"
-                f"🎯 Entry: <b>{signal.get('entry')}</b>\n"
-                f"✅ TP: <b>{signal.get('target')}</b>\n"
-                f"🛑 SL: <b>{signal.get('stop')}</b>\n"
-                f"⚖️ R/R: <b>{signal.get('rr','1:2')}</b>\n\n"
-                f"⚠️ <i>NOT FINANCIAL ADVICE</i>\n\nConfirm trade?"
+            def build_summary():
+                balance = get_account_balance()
+                margin_used = round(balance * pct / 100, 2)
+                position_size = round(margin_used * lev, 2)
+                liq_pct = round((margin_used / position_size) * 100, 2) if margin=="ISOLATED" else round((balance / position_size) * 100, 2)
+                bot_state["setup"]["balance"] = balance
+                bot_state["setup"]["margin_used"] = margin_used
+                bot_state["setup"]["position_size"] = position_size
+
+                summary = (
+                    f"📋 <b>TRADE SUMMARY — {symbol}</b>\n\n"
+                    f"Signal: <b>{signal['signal']}</b> ({signal.get('confidence')}% confidence)\n\n"
+                    f"💰 Balance: <b>${balance} USDC</b>\n"
+                    f"📊 Margin: <b>${margin_used} USDC</b> ({pct}%)\n"
+                    f"⚡ Leverage: <b>{lev}x</b>\n"
+                    f"📦 Notional: <b>${position_size}</b>\n"
+                    f"🔐 Margin Type: <b>{margin}</b>\n"
+                    f"⚠️ Liq at: <b>{liq_pct}% against you</b>\n\n"
+                    f"🎯 Entry: <b>{signal.get('entry')}</b>\n"
+                    f"✅ TP: <b>{signal.get('target')}</b>\n"
+                    f"🛑 SL: <b>{signal.get('stop')}</b>\n"
+                    f"⚖️ R/R: <b>{signal.get('rr','1:2')}</b>\n\n"
+                    f"⚠️ <i>NOT FINANCIAL ADVICE</i>"
+                )
+                tg_edit(
+                    bot_state["setup"]["flow_msg_id"],
+                    summary,
+                    [[
+                        {"text": "✅ CONFIRM TRADE", "callback_data": "confirm_yes"},
+                        {"text": "◀ Back", "callback_data": "back_lev"},
+                    ],[
+                        {"text": "❌ Cancel", "callback_data": "confirm_no"},
+                    ]]
+                )
+            threading.Thread(target=build_summary, daemon=True).start()
+
+        elif data == "back_lev" and bot_state["waiting_for"] == "confirm":
+            bot_state["waiting_for"] = "leverage"
+            trade = bot_state["pending_trade"]
+            margin = bot_state["setup"]["margin"]
+            pct = bot_state["setup"]["pct"]
+            tg_edit(
+                bot_state["setup"]["flow_msg_id"],
+                f"🔧 <b>TRADE SETUP — {trade['symbol']}</b>\n\n"
+                f"✅ Margin: <b>{margin}</b>\n"
+                f"✅ Balance: <b>{pct}%</b>\n\n"
+                f"Step 3️⃣ — Choose leverage:",
+                [[
+                    {"text": "5x",  "callback_data": "lev_5"},
+                    {"text": "10x", "callback_data": "lev_10"},
+                    {"text": "20x", "callback_data": "lev_20"},
+                    {"text": "50x", "callback_data": "lev_50"},
+                ],[
+                    {"text": "◀ Back", "callback_data": "back_pct"},
+                    {"text": "❌ Cancel", "callback_data": "confirm_no"},
+                ]]
             )
-
-            bot_state["setup"]["balance"] = balance
-            bot_state["setup"]["margin_used"] = margin_used
-            bot_state["setup"]["position_size"] = position_size
-
-            mid = tg_send_get_id(summary, [[
-                {"text": "✅ CONFIRM TRADE", "callback_data": "confirm_yes"},
-                {"text": "❌ CANCEL", "callback_data": "confirm_no"},
-            ]])
-            if mid: bot_state["setup"]["step_msgs"].append(mid)
 
         elif data == "confirm_yes" and bot_state["waiting_for"] == "confirm":
             trade = bot_state["pending_trade"]
             setup = bot_state["setup"]
             signal = trade["signal"]
-            tg(f"⚡ Executing <b>{trade['symbol']}</b> {signal['signal']} on Hyperliquid...")
+            tg_edit(
+                setup["flow_msg_id"],
+                f"⚡ <b>EXECUTING {trade['symbol']} {signal['signal']}...</b>\n\nPlease wait..."
+            )
 
             result = open_position(
                 symbol=trade["symbol"],
@@ -909,9 +1018,15 @@ def handle_update(update):
             )
 
             if result.get("success"):
-                # Delete all setup step messages
-                for mid in bot_state["setup"].get("step_msgs", []):
-                    tg_delete(mid)
+                tg_edit(
+                    setup["flow_msg_id"],
+                    f"✅ <b>POSITION OPENED!</b>\n\n"
+                    f"🪙 {trade['symbol']} {signal['signal']}\n"
+                    f"📦 Size: ${setup['position_size']} @ {setup['leverage']}x\n"
+                    f"🔐 Margin: {setup['margin']}\n"
+                    f"🎯 TP: {signal.get('target')} | SL: {signal.get('stop')}\n\n"
+                    f"Type /stats to monitor."
+                )
                 bot_state["active_position"] = {
                     "symbol": trade["symbol"],
                     "side": signal["signal"],
@@ -925,28 +1040,25 @@ def handle_update(update):
                     "order_id": result.get("order_id"),
                 }
                 bot_state["trade_history"].append(bot_state["active_position"].copy())
-                tg(
-                    f"✅ <b>POSITION OPENED!</b>\n\n"
-                    f"🪙 {trade['symbol']} {signal['signal']}\n"
-                    f"📦 Size: ${setup['position_size']} @ {setup['leverage']}x\n"
-                    f"🎯 TP: {signal.get('target')} | SL: {signal.get('stop')}\n\n"
-                    f"Type /stats to monitor your position."
-                )
             else:
-                tg("❌ <b>Order failed.</b> Check Hyperliquid account and try again.")
+                tg_edit(
+                    setup["flow_msg_id"],
+                    f"❌ <b>Order failed.</b>\n\n{result.get('error','Check Hyperliquid account.')}"
+                )
 
             bot_state["pending_trade"] = None
             bot_state["waiting_for"] = None
             bot_state["setup"] = {}
 
-        elif data in ["confirm_no","skip"]:
-            # Delete step messages on cancel
-            for mid in bot_state.get("setup", {}).get("step_msgs", []):
-                tg_delete(mid)
+        elif data in ["confirm_no", "skip"]:
+            flow_mid = bot_state.get("setup", {}).get("flow_msg_id")
+            if flow_mid:
+                tg_edit(flow_mid, "⏭ Trade cancelled.")
+            else:
+                tg("⏭ Trade cancelled.")
             bot_state["pending_trade"] = None
             bot_state["waiting_for"] = None
             bot_state["setup"] = {}
-            tg("⏭ Trade cancelled.")
 
     # Handle text commands
     elif "message" in update:
@@ -958,13 +1070,12 @@ def handle_update(update):
                 "🤖 <b>CIPHER TRADING BOT</b>\n\n"
                 "I scan top 30 tokens and find the best trading setups.\n\n"
                 "Commands:\n"
-                "/scan — Run scan now\n"
+                "/scan — Scan for setups\n"
                 "/timeframe — Change scan timeframe\n"
+                "/balance — Check Hyperliquid balance\n"
                 "/stats — View open position\n"
                 "/close — Close active position\n"
                 "/history — Trade history\n"
-                "/balance — Check Hyperliquid balance\n"
-                "/stop — Stop bot\n"
             )
 
         elif text == "/timeframe":
@@ -1020,8 +1131,11 @@ def handle_update(update):
 
         elif text == "/balance":
             def fetch_and_send_balance():
-                bal = get_account_balance()
-                tg(f"💰 Hyperliquid Balance: <b>${bal:.2f} USDC</b>")
+                try:
+                    bal = get_account_balance()
+                    tg(f"💰 Hyperliquid Balance: <b>${bal:.2f} USDC</b>")
+                except Exception as e:
+                    tg(f"❌ Balance fetch failed: {str(e)[:100]}")
             tg("⏳ Fetching balance...")
             threading.Thread(target=fetch_and_send_balance, daemon=True).start()
 
@@ -1036,8 +1150,7 @@ def handle_update(update):
             tg(msg)
 
         elif text == "/stop":
-            bot_state["running"] = False
-            tg("🛑 Bot stopped.")
+            tg("⚠️ /stop is disabled. Restart the bot from Render if needed.")
 
     # Handle close confirm
     if "callback_query" in update:
