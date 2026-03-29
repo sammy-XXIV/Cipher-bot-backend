@@ -100,27 +100,59 @@ def tg_answer_callback(callback_id):
 # MARKET DATA
 # ============================================================
 def get_top_tokens():
+    # Try Binance first
     try:
         r = requests.get("https://api.binance.com/api/v3/ticker/24hr", timeout=10)
-        tickers = r.json()
-        pairs = [
-            t for t in tickers
-            if t["symbol"].endswith("USDT")
-            and float(t["quoteVolume"]) > 5_000_000
-        ]
-        pairs.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
-        return [
-            {
-                "symbol": t["symbol"].replace("USDT",""),
-                "price": float(t["lastPrice"]),
-                "change": float(t["priceChangePercent"]),
-                "volume": float(t["quoteVolume"]),
-            }
-            for t in pairs[:TOP_N]
-        ]
+        data = r.json()
+        if isinstance(data, list) and len(data) > 10:
+            pairs = [t for t in data if isinstance(t, dict) and t.get("symbol","").endswith("USDT") and float(t.get("quoteVolume",0)) > 5_000_000]
+            pairs.sort(key=lambda x: float(x["quoteVolume"]), reverse=True)
+            log.info(f"Tokens from BINANCE: {len(pairs[:TOP_N])}")
+            return [{"symbol": t["symbol"].replace("USDT",""), "price": float(t["lastPrice"]), "change": float(t["priceChangePercent"]), "volume": float(t["quoteVolume"])} for t in pairs[:TOP_N]]
     except Exception as e:
-        log.error(f"get_top_tokens: {e}")
-        return []
+        log.error(f"Binance ticker error: {e}")
+
+    # Fallback: Bybit
+    try:
+        r = requests.get("https://api.bybit.com/v5/market/tickers?category=spot", timeout=10)
+        data = r.json()
+        lst = data.get("result", {}).get("list", [])
+        pairs = [t for t in lst if t.get("symbol","").endswith("USDT") and float(t.get("turnover24h",0)) > 0]
+        pairs.sort(key=lambda x: float(x.get("turnover24h",0)), reverse=True)
+        if pairs:
+            log.info(f"Tokens from BYBIT: {len(pairs[:TOP_N])}")
+            return [{"symbol": t["symbol"].replace("USDT",""), "price": float(t["lastPrice"]), "change": float(t.get("price24hPcnt",0))*100, "volume": float(t.get("turnover24h",0))} for t in pairs[:TOP_N]]
+    except Exception as e:
+        log.error(f"Bybit ticker error: {e}")
+
+    # Fallback: OKX
+    try:
+        r = requests.get("https://www.okx.com/api/v5/market/tickers?instType=SPOT", timeout=10)
+        data = r.json()
+        lst = data.get("data", [])
+        pairs = [t for t in lst if t.get("instId","").endswith("-USDT") and float(t.get("volCcy24h",0)) > 0]
+        pairs.sort(key=lambda x: float(x.get("volCcy24h",0)), reverse=True)
+        if pairs:
+            log.info(f"Tokens from OKX: {len(pairs[:TOP_N])}")
+            return [{"symbol": t["instId"].replace("-USDT",""), "price": float(t["last"]), "change": ((float(t["last"])-float(t["open24h"]))/float(t["open24h"]))*100 if float(t.get("open24h",1))>0 else 0, "volume": float(t.get("volCcy24h",0))} for t in pairs[:TOP_N]]
+    except Exception as e:
+        log.error(f"OKX ticker error: {e}")
+
+    # Fallback: MEXC
+    try:
+        r = requests.get("https://www.mexc.com/open/api/v2/market/ticker", timeout=10)
+        data = r.json()
+        lst = data.get("data", [])
+        pairs = [t for t in lst if t.get("symbol","").endswith("_USDT") and float(t.get("volume",0)) > 0]
+        pairs.sort(key=lambda x: float(x.get("amount",0)), reverse=True)
+        if pairs:
+            log.info(f"Tokens from MEXC: {len(pairs[:TOP_N])}")
+            return [{"symbol": t["symbol"].replace("_USDT",""), "price": float(t["last"]), "change": float(t.get("priceChangePercent",0)), "volume": float(t.get("volume",0))} for t in pairs[:TOP_N]]
+    except Exception as e:
+        log.error(f"MEXC ticker error: {e}")
+
+    log.error("All token sources failed!")
+    return []
 
 def get_candles(symbol, interval=None, limit=None):
     tf = interval or bot_state["timeframe"]
@@ -226,48 +258,155 @@ def calc_indicators(candles):
     # Volume
     avg_vol=sum(vols[-20:])/20
     vol_ratio=vols[-1]/avg_vol if avg_vol>0 else 1
+    vol_strength = 'HIGH' if vol_ratio>1.5 else 'ABOVE AVG' if vol_ratio>1 else 'LOW'
 
-    # Score — confluence of signals
+    # Stochastic RSI
+    stoch_rsi = 50
+    try:
+        rsi_arr=[]
+        for i in range(14, n):
+            gg=ll=0
+            for j in range(i-13, i+1):
+                d=closes[j]-closes[j-1]
+                if d>0: gg+=d
+                else: ll-=d
+            rsi_arr.append(100-(100/(1+(gg/ll if ll>0 else 100))))
+        if len(rsi_arr)>=14:
+            rmin=min(rsi_arr[-14:]); rmax=max(rsi_arr[-14:])
+            stoch_rsi=round((rsi_arr[-1]-rmin)/(rmax-rmin)*100) if rmax!=rmin else 50
+    except: pass
+
+    # VWAP
+    vwap=0
+    try:
+        cumTPV=cumVol=0
+        for i in range(n):
+            tp=(highs[i]+lows[i]+closes[i])/3
+            cumTPV+=tp*vols[i]; cumVol+=vols[i]
+        vwap=round(cumTPV/cumVol,4) if cumVol>0 else closes[-1]
+    except: pass
+
+    # Fibonacci Retracement
+    swing_high=max(highs[-50:]) if n>=50 else max(highs)
+    swing_low=min(lows[-50:])   if n>=50 else min(lows)
+    fib_range=swing_high-swing_low
+    fib382=round(swing_high-fib_range*0.382, 4)
+    fib500=round(swing_high-fib_range*0.500, 4)
+    fib618=round(swing_high-fib_range*0.618, 4)
+
+    # Candlestick Pattern (last candle)
+    candle_pattern = 'NONE'
+    try:
+        last=candles[-1]; prev=candles[-2]
+        body=abs(last['c']-last['o']); rng=last['h']-last['l']
+        upper_wick=last['h']-max(last['o'],last['c'])
+        lower_wick=min(last['o'],last['c'])-last['l']
+        is_green=last['c']>last['o']
+        prev_green=prev['c']>prev['o']
+        if rng>0 and body/rng<0.1:
+            candle_pattern='DOJI'
+        elif not is_green and lower_wick>body*2 and upper_wick<body*0.5:
+            candle_pattern='HAMMER (bullish)'
+        elif is_green and upper_wick>body*2 and lower_wick<body*0.5:
+            candle_pattern='SHOOTING STAR (bearish)'
+        elif is_green and not prev_green and last['o']<prev['c'] and last['c']>prev['o']:
+            candle_pattern='BULLISH ENGULFING'
+        elif not is_green and prev_green and last['o']>prev['c'] and last['c']<prev['o']:
+            candle_pattern='BEARISH ENGULFING'
+    except: pass
+
+    # RSI Divergence
+    divergence = 'NONE'
+    try:
+        mid = n // 2
+        price_end=closes[-1]; price_mid=closes[mid]
+        rsi_end=rsi
+        gg=ll=0
+        for i in range(mid-13, mid+1):
+            d=closes[i]-closes[i-1]
+            if d>0: gg+=d
+            else: ll-=d
+        rsi_mid=100-(100/(1+(gg/ll if ll>0 else 100)))
+        if price_end>price_mid and rsi_end<rsi_mid: divergence='BEARISH DIVERGENCE'
+        elif price_end<price_mid and rsi_end>rsi_mid: divergence='BULLISH DIVERGENCE'
+    except: pass
+
+    # Score — confluence of signals (enhanced)
     score=0
-    if rsi<40: score+=2       # oversold
+    if rsi<40: score+=2
     elif rsi<50: score+=1
-    if macd>0: score+=2       # bullish momentum
-    if closes[-1]>e20[-1]: score+=1  # above EMA20
-    if closes[-1]>e50[-1]: score+=1  # above EMA50
-    if adx>25: score+=1       # strong trend
-    if vol_ratio>1.2: score+=1 # high volume
+    if macd>0: score+=2
+    if closes[-1]>e20[-1]: score+=1
+    if closes[-1]>e50[-1]: score+=1
+    if closes[-1]>vwap: score+=1
+    if adx>25: score+=1
+    if vol_ratio>1.2: score+=1
+    if stoch_rsi<25: score+=1
+    if 'bullish' in candle_pattern.lower() or 'HAMMER' in candle_pattern: score+=1
+    if divergence=='BULLISH DIVERGENCE': score+=2
 
     return {
         "rsi": rsi, "macd": round(macd,4), "atr": round(atr,4),
         "e20": round(e20[-1],4), "e50": round(e50[-1],4),
         "bb_upper": round(bb_upper,4), "bb_lower": round(bb_lower,4),
         "sup": round(sup,4), "res": round(res,4),
-        "adx": adx, "vol_ratio": round(vol_ratio,2),
+        "adx": adx, "vol_ratio": round(vol_ratio,2), "vol_strength": vol_strength,
+        "stoch_rsi": stoch_rsi, "vwap": vwap,
+        "fib382": fib382, "fib500": fib500, "fib618": fib618,
+        "candle_pattern": candle_pattern, "divergence": divergence,
+        "swing_high": round(swing_high,4), "swing_low": round(swing_low,4),
         "price": closes[-1], "score": score,
     }
 
 # ============================================================
 # AI SIGNAL
 # ============================================================
-def get_ai_signal(symbol, indicators):
+def get_fear_greed():
+    try:
+        r = requests.get("https://api.alternative.me/fng/?limit=1", timeout=5)
+        d = r.json()
+        val = int(d["data"][0]["value"])
+        label = d["data"][0]["value_classification"].upper()
+        return f"{label} ({val}/100)"
+    except:
+        return "UNKNOWN"
+
+def get_ai_signal(symbol, indicators, fear_greed="UNKNOWN"):
     if not ANTHROPIC_API_KEY:
         return None
     ind = indicators
     prompt = f"""You are CIPHER, elite crypto technical analyst. Analyze {symbol} for a trade ({bot_state['tf_label']} timeframe).
 
 CURRENT PRICE: ${ind['price']}
-RSI(14): {ind['rsi']} {'(OVERSOLD)' if ind['rsi']<30 else '(OVERBOUGHT)' if ind['rsi']>70 else '(NEUTRAL)'}
-MACD: {'BULLISH' if ind['macd']>0 else 'BEARISH'} ({ind['macd']})
-EMA20: ${ind['e20']} - price {'ABOVE' if ind['price']>ind['e20'] else 'BELOW'}
-EMA50: ${ind['e50']} - price {'ABOVE' if ind['price']>ind['e50'] else 'BELOW'}
-ADX: {ind['adx']} {'(STRONG TREND)' if ind['adx']>25 else '(WEAK/RANGING)'}
-Bollinger: Upper ${ind['bb_upper']} Lower ${ind['bb_lower']}
-Support: ${ind['sup']} Resistance: ${ind['res']}
-ATR(14): ${ind['atr']}
-Volume: {ind['vol_ratio']}x average
+MARKET SENTIMENT: Fear & Greed — {fear_greed}
 
-Respond ONLY with JSON:
-{{"signal":"LONG or SHORT or SKIP","confidence":50-95,"entry":"price","stop":"1.5x ATR stop loss price","target":"3x ATR take profit price","reasoning":"1-2 sentences","rr":"ratio e.g. 1:2"}}"""
+TREND:
+- EMA20: ${ind['e20']} — price {'ABOVE (bullish)' if ind['price']>ind['e20'] else 'BELOW (bearish)'}
+- EMA50: ${ind['e50']} — price {'ABOVE (bullish)' if ind['price']>ind['e50'] else 'BELOW (bearish)'}
+- VWAP: ${ind['vwap']} — price {'ABOVE (bullish)' if ind['price']>ind['vwap'] else 'BELOW (bearish)'}
+- ADX: {ind['adx']} {'(STRONG TREND)' if ind['adx']>25 else '(WEAK/RANGING — caution)'}
+
+MOMENTUM:
+- RSI(14): {ind['rsi']} {'(OVERSOLD)' if ind['rsi']<30 else '(OVERBOUGHT)' if ind['rsi']>70 else '(NEUTRAL)'}
+- Stochastic RSI: {ind['stoch_rsi']} {'(OVERSOLD)' if ind['stoch_rsi']<20 else '(OVERBOUGHT)' if ind['stoch_rsi']>80 else '(NEUTRAL)'}
+- MACD: {'BULLISH' if ind['macd']>0 else 'BEARISH'} ({ind['macd']})
+- RSI Divergence: {ind['divergence']}
+
+VOLATILITY:
+- ATR(14): ${ind['atr']}
+- Bollinger Upper: ${ind['bb_upper']} Lower: ${ind['bb_lower']}
+
+KEY LEVELS:
+- Support: ${ind['sup']} | Resistance: ${ind['res']}
+- Swing High: ${ind['swing_high']} | Swing Low: ${ind['swing_low']}
+- Fib 38.2%: ${ind['fib382']} | 50%: ${ind['fib500']} | 61.8%: ${ind['fib618']}
+
+PRICE ACTION:
+- Candlestick Pattern: {ind['candle_pattern']}
+- Volume: {ind['vol_strength']} ({ind['vol_ratio']}x average)
+
+Respond ONLY with JSON (no markdown):
+{{"signal":"LONG or SHORT or SKIP","confidence":50-95,"entry":"price","stop":"1.5x ATR stop loss","target":"3x ATR take profit","reasoning":"2-3 sentences","rr":"ratio e.g. 1:2","caution":"1 sentence on main risk"}}"""
 
     try:
         r = requests.post(
@@ -291,40 +430,58 @@ def mexc_sign(params):
     return sig
 
 def mexc_request(method, path, params=None, body=None):
-    ts = str(int(time.time()*1000))
-    headers = {
-        "ApiKey": MEXC_ACCESS_KEY,
-        "Request-Time": ts,
-        "Content-Type": "application/json",
-    }
+    ts = str(int(time.time() * 1000))
     if params is None:
         params = {}
-    params["timestamp"] = ts
-    sig = mexc_sign(params)
-    params["signature"] = sig
 
-    url = MEXC_BASE + path
-    try:
-        if method == "GET":
-            r = requests.get(url, params=params, headers=headers, timeout=10)
-        else:
-            headers["Signature"] = hmac.new(
-                MEXC_SECRET_KEY.encode(),
-                (ts + MEXC_ACCESS_KEY + ts + json.dumps(body or {})).encode(),
-                hashlib.sha256
-            ).hexdigest()
-            r = requests.post(url, params={"timestamp": ts}, json=body, headers=headers, timeout=10)
-        return r.json()
-    except Exception as e:
-        log.error(f"MEXC request error: {e}")
-        return {"error": str(e)}
+    if method == "GET":
+        # GET: sign query string
+        params["timestamp"] = ts
+        sorted_params = "&".join(f"{k}={v}" for k, v in sorted(params.items()))
+        sig = hmac.new(MEXC_SECRET_KEY.encode(), sorted_params.encode(), hashlib.sha256).hexdigest()
+        params["signature"] = sig
+        headers = {
+            "ApiKey": MEXC_ACCESS_KEY,
+            "Request-Time": ts,
+            "Content-Type": "application/json",
+        }
+        try:
+            r = requests.get(MEXC_BASE + path, params=params, headers=headers, timeout=10)
+            return r.json()
+        except Exception as e:
+            log.error(f"MEXC GET error: {e}")
+            return {"error": str(e)}
+    else:
+        # POST: sign body
+        body = body or {}
+        body_str = json.dumps(body)
+        sign_str = ts + MEXC_ACCESS_KEY + ts + body_str
+        sig = hmac.new(MEXC_SECRET_KEY.encode(), sign_str.encode(), hashlib.sha256).hexdigest()
+        headers = {
+            "ApiKey": MEXC_ACCESS_KEY,
+            "Request-Time": ts,
+            "Signature": sig,
+            "Content-Type": "application/json",
+        }
+        try:
+            r = requests.post(MEXC_BASE + path, json=body, headers=headers, timeout=10)
+            return r.json()
+        except Exception as e:
+            log.error(f"MEXC POST error: {e}")
+            return {"error": str(e)}
 
 def get_account_balance():
     try:
         r = mexc_request("GET", "/api/v1/private/account/assets")
+        log.info(f"Balance response: {str(r)[:200]}")
         assets = r.get("data", [])
-        usdt = next((a for a in assets if a.get("currency","").upper()=="USDT"), None)
-        if usdt:
+        if isinstance(assets, list):
+            usdt = next((a for a in assets if str(a.get("currency","")).upper() == "USDT"), None)
+            if usdt:
+                return float(usdt.get("availableBalance", 0))
+        elif isinstance(assets, dict):
+            # some endpoints return dict with currency as key
+            usdt = assets.get("USDT", {})
             return float(usdt.get("availableBalance", 0))
     except Exception as e:
         log.error(f"Balance error: {e}")
@@ -425,12 +582,16 @@ def close_position(symbol):
 # ============================================================
 def run_scan():
     log.info(f"Starting scan on {bot_state['tf_label']} timeframe...")
-    tg(f"🔍 <b>CIPHER BOT</b> — Starting hourly scan of top 30 tokens on <b>{bot_state['tf_label']}</b> timeframe...")
+    tg(f"🔍 <b>CIPHER BOT</b> — Starting scan of top {TOP_N} tokens on <b>{bot_state['tf_label']}</b> timeframe...")
 
     tokens = get_top_tokens()
     if not tokens:
         tg("⚠️ Failed to fetch token list. Retrying next hour.")
         return
+
+    # Fetch Fear & Greed once for all tokens
+    fear_greed = get_fear_greed()
+    log.info(f"Fear & Greed: {fear_greed}")
 
     results = []
     for t in tokens:
@@ -440,8 +601,8 @@ def run_scan():
         ind = calc_indicators(candles)
         if not ind:
             continue
-        if ind["score"] >= 5 and ind["adx"] > 20:  # only strong setups
-            signal = get_ai_signal(t["symbol"], ind)
+        if ind["score"] >= 5 and ind["adx"] > 20:
+            signal = get_ai_signal(t["symbol"], ind, fear_greed)
             if signal and signal.get("signal") != "SKIP" and signal.get("confidence", 0) >= 70:
                 results.append({
                     "symbol": t["symbol"],
@@ -450,7 +611,7 @@ def run_scan():
                     "signal": signal,
                     "score": ind["score"],
                 })
-        time.sleep(0.3)  # rate limit
+        time.sleep(0.3)
 
     results.sort(key=lambda x: x["signal"].get("confidence", 0), reverse=True)
     bot_state["scan_results"] = results
@@ -474,7 +635,10 @@ def run_scan():
         msg += f"   📈 Confidence: {s.get('confidence')}%\n"
         msg += f"   🎯 Entry: {s.get('entry')} | TP: {s.get('target')} | SL: {s.get('stop')}\n"
         msg += f"   ⚖️ R/R: {s.get('rr','1:2')}\n"
-        msg += f"   📝 {s.get('reasoning','')}\n\n"
+        msg += f"   📝 {s.get('reasoning','')}\n"
+        if s.get('caution'):
+            msg += f"   ⚠️ {s.get('caution')}\n"
+        msg += "\n"
 
     msg += "Select a token to trade or skip:"
 
@@ -840,3 +1004,4 @@ if __name__ == '__main__':
     tg("🤖 <b>CIPHER BOT ONLINE</b>\n\nType /start for commands.")
     port = int(os.environ.get("PORT", 5001))
     app.run(host='0.0.0.0', port=port, debug=False)
+
