@@ -152,6 +152,7 @@ def register_commands():
     commands = [
         {"command": "start",     "description": "Show all commands"},
         {"command": "scan",      "description": "Scan top 30 tokens for setups"},
+        {"command": "ca",        "description": "Analyze a token by contract address"},
         {"command": "timeframe", "description": "Change scan timeframe"},
         {"command": "balance",   "description": "Check Hyperliquid balance"},
         {"command": "stats",     "description": "View open position stats"},
@@ -962,9 +963,10 @@ def handle_update(update):
                 "I scan top 30 tokens and find the best trading setups.\n\n"
                 "Commands:\n"
                 "/scan — Scan for setups\n"
+                "/ca — Analyze token by contract address\n"
                 "/timeframe — Change scan timeframe\n"
                 "/balance — Check Hyperliquid balance\n"
-                "/stats — View open position\n"
+                "/stats — View open positions (live from HL)\n"
                 "/close — Close active position\n"
                 "/history — Trade history\n"
             )
@@ -987,38 +989,86 @@ def handle_update(update):
             threading.Thread(target=run_scan, daemon=True).start()
 
         elif text == "/stats":
-            pos = bot_state.get("active_position")
-            if not pos:
-                tg("📊 No active position.")
-                return
-            live = get_position_stats(pos["symbol"])
-            if live:
-                pnl = float(live.get("unrealized_pnl",0))
-                tg(
-                    f"📊 <b>POSITION STATS</b>\n\n"
-                    f"🪙 Symbol: <b>{live['symbol']}</b>\n"
-                    f"📈 Side: <b>{live['side']}</b>\n"
-                    f"💰 Entry: <b>{live['entry_price']}</b>\n"
-                    f"📦 Size: <b>{live['size']}</b>\n"
-                    f"⚡ Leverage: <b>{live['leverage']}x</b>\n"
-                    f"🔐 Margin: <b>{live['margin_type']}</b>\n"
-                    f"⚠️ Liquidation: <b>{live['liquidation']}</b>\n"
-                    f"{'🟢' if pnl>=0 else '🔴'} Unrealized PnL: <b>${pnl:.2f}</b>\n"
-                    f"🎯 TP: {pos['target']} | SL: {pos['stop']}\n"
-                )
-            else:
-                tg("📊 Position may be closed or data unavailable.")
+            def fetch_stats():
+                try:
+                    info = get_hl_info()
+                    user_state = info.user_state(HL_WALLET)
+                    positions = user_state.get("assetPositions", [])
+                    active = [p for p in positions if float(p.get("position",{}).get("szi",0)) != 0]
+
+                    if not active:
+                        tg("📊 No open positions on Hyperliquid.")
+                        return
+
+                    msg = "📊 <b>OPEN POSITIONS</b>\n\n"
+                    for p in active:
+                        pos = p.get("position", {})
+                        symbol = pos.get("coin","")
+                        size = float(pos.get("szi", 0))
+                        side = "LONG 🟢" if size > 0 else "SHORT 🔴"
+                        entry = float(pos.get("entryPx", 0))
+                        pnl = float(pos.get("unrealizedPnl", 0))
+                        liq = float(pos.get("liquidationPx") or 0)
+                        lev = pos.get("leverage", {}).get("value", "—")
+                        margin_used = float(pos.get("marginUsed", 0))
+
+                        # Get open orders (TP/SL) live from Hyperliquid
+                        tp_price = sl_price = "—"
+                        try:
+                            open_orders = info.open_orders(HL_WALLET)
+                            for o in open_orders:
+                                if o.get("coin") == symbol and o.get("reduceOnly"):
+                                    ot = o.get("orderType","").lower()
+                                    px = o.get("limitPx", "—")
+                                    if "tp" in ot or (size > 0 and float(px or 0) > entry) or (size < 0 and float(px or 0) < entry):
+                                        tp_price = px
+                                    else:
+                                        sl_price = px
+                        except: pass
+
+                        msg += (
+                            f"🪙 <b>{symbol}</b> — {side}\n"
+                            f"💰 Entry: <b>${entry}</b>\n"
+                            f"📦 Size: <b>{abs(size)}</b> coins\n"
+                            f"💵 Margin: <b>${margin_used:.2f}</b>\n"
+                            f"⚡ Leverage: <b>{lev}x</b>\n"
+                            f"⚠️ Liquidation: <b>${liq}</b>\n"
+                            f"{'🟢' if pnl>=0 else '🔴'} PnL: <b>${pnl:.2f}</b>\n"
+                            f"🎯 TP: {tp_price} | SL: {sl_price}\n\n"
+                        )
+
+                    tg(msg, [[{"text": "🔴 Close Position", "callback_data": f"close_{active[0]['position']['coin']}"}]])
+                except Exception as e:
+                    log.error(f"Stats error: {e}")
+                    tg(f"❌ Could not fetch stats: {str(e)[:100]}")
+            tg("⏳ Fetching live position data...")
+            threading.Thread(target=fetch_stats, daemon=True).start()
 
         elif text == "/close":
-            pos = bot_state.get("active_position")
-            if not pos:
-                tg("No active position to close.")
-                return
-            tg(f"Closing {pos['symbol']} position...", [[
-                {"text": "✅ Yes, close it", "callback_data": "close_yes"},
-                {"text": "❌ No", "callback_data": "close_no"},
-            ]])
-            bot_state["waiting_for"] = "close_confirm"
+            def fetch_and_close():
+                try:
+                    info = get_hl_info()
+                    user_state = info.user_state(HL_WALLET)
+                    positions = [p for p in user_state.get("assetPositions",[]) if float(p.get("position",{}).get("szi",0)) != 0]
+                    if not positions:
+                        tg("📊 No open positions to close.")
+                        return
+                    if len(positions) == 1:
+                        symbol = positions[0]["position"]["coin"]
+                        tg(f"Close <b>{symbol}</b> position?", [[
+                            {"text": f"✅ Yes, close {symbol}", "callback_data": f"close_{symbol}"},
+                            {"text": "❌ No", "callback_data": "close_no"},
+                        ]])
+                        bot_state["waiting_for"] = "close_confirm"
+                    else:
+                        # Multiple positions — let user pick
+                        buttons = [[{"text": p["position"]["coin"], "callback_data": f"close_{p['position']['coin']}"}] for p in positions]
+                        buttons.append([{"text": "❌ Cancel", "callback_data": "close_no"}])
+                        tg("Which position to close?", buttons)
+                        bot_state["waiting_for"] = "close_confirm"
+                except Exception as e:
+                    tg(f"❌ Error: {str(e)[:100]}")
+            threading.Thread(target=fetch_and_close, daemon=True).start()
 
         elif text == "/balance":
             def fetch_and_send_balance():
@@ -1040,22 +1090,126 @@ def handle_update(update):
                 msg += f"• {t['symbol']} {t['side']} — Entry: {t['entry']} | Size: ${t['size']}\n"
             tg(msg)
 
+        elif text == "/ca":
+            tg(
+                "📋 <b>CONTRACT ADDRESS SCAN</b>\n\n"
+                "Paste a contract address (CA) and I'll analyze it.\n\n"
+                "Supported chains: ETH, BSC, Solana, Base, Arbitrum\n\n"
+                "Just paste the CA directly in chat!"
+            )
+            bot_state["waiting_for"] = "ca_input"
+
         elif text == "/stop":
             tg("⚠️ /stop is disabled. Restart the bot from Render if needed.")
+
+        # CA input handler — if user pastes a contract address
+        elif bot_state.get("waiting_for") == "ca_input" or (len(text) > 30 and (text.startswith("0x") or len(text) == 44)):
+            bot_state["waiting_for"] = None
+            ca = text.strip()
+            def scan_ca(ca):
+                try:
+                    tg(f"🔍 Scanning CA: <code>{ca[:20]}...</code>")
+                    # Fetch token info from DexScreener
+                    r = requests.get(f"https://api.dexscreener.com/latest/dex/tokens/{ca}", timeout=10)
+                    data = r.json()
+                    pairs = data.get("pairs", [])
+                    if not pairs:
+                        tg("❌ Token not found on DexScreener. Check the CA and try again.")
+                        return
+
+                    # Get best pair by liquidity
+                    pair = sorted(pairs, key=lambda x: float(x.get("liquidity",{}).get("usd",0) or 0), reverse=True)[0]
+                    symbol = pair.get("baseToken",{}).get("symbol","UNKNOWN")
+                    name = pair.get("baseToken",{}).get("name","Unknown")
+                    price = float(pair.get("priceUsd",0) or 0)
+                    change24h = float(pair.get("priceChange",{}).get("h24",0) or 0)
+                    volume24h = float(pair.get("volume",{}).get("h24",0) or 0)
+                    liquidity = float(pair.get("liquidity",{}).get("usd",0) or 0)
+                    dex = pair.get("dexId","unknown")
+                    chain = pair.get("chainId","unknown")
+                    fdv = float(pair.get("fdv",0) or 0)
+                    txns = pair.get("txns",{}).get("h24",{})
+                    buys = txns.get("buys",0)
+                    sells = txns.get("sells",0)
+
+                    # Get price chart from DexScreener
+                    pair_addr = pair.get("pairAddress","")
+
+                    # Build AI prompt with on-chain data
+                    prompt = f"""You are CIPHER, elite crypto analyst. Analyze this token from on-chain data only.
+
+TOKEN: {symbol} ({name})
+CONTRACT: {ca}
+CHAIN: {chain}
+DEX: {dex}
+
+PRICE DATA:
+- Price: ${price}
+- 24H Change: {change24h:+.2f}%
+- 24H Volume: ${volume24h:,.0f}
+- Liquidity: ${liquidity:,.0f}
+- FDV: ${fdv:,.0f}
+- 24H Buys: {buys} | Sells: {sells}
+- Buy/Sell Ratio: {buys/(buys+sells)*100:.1f}% buys if {buys+sells>0} else N/A
+
+RISK ASSESSMENT:
+- Low liquidity (<$50k) = HIGH RUG RISK
+- High sell pressure (>60% sells) = BEARISH
+- Volume/Liquidity ratio shows trading activity
+
+Provide signal for this token. Be extra cautious with low liquidity tokens.
+
+Respond ONLY with JSON:
+{{"signal":"LONG or SHORT or AVOID","confidence":30-85,"reasoning":"2-3 sentences","risk":"LOW or MEDIUM or HIGH or EXTREME","risk_reason":"one sentence","caution":"main red flags if any","entry":"price or AVOID","target":"price target or N/A","stop":"stop loss or N/A"}}"""
+
+                    r2 = requests.post(
+                        "https://api.anthropic.com/v1/messages",
+                        headers={"x-api-key": ANTHROPIC_API_KEY, "anthropic-version": "2023-06-01", "Content-Type": "application/json"},
+                        json={"model": "claude-sonnet-4-20250514", "max_tokens": 400, "messages": [{"role": "user", "content": prompt}]},
+                        timeout=30
+                    )
+                    raw = r2.json()["content"][0]["text"].strip().replace("```json","").replace("```","").strip()
+                    a = json.loads(raw)
+
+                    emoji = "🟢" if a["signal"]=="LONG" else "🔴" if a["signal"]=="SHORT" else "⛔"
+                    risk_color = "🟢" if a["risk"]=="LOW" else "🟡" if a["risk"]=="MEDIUM" else "🔴"
+
+                    msg = (
+                        f"🔍 <b>CA ANALYSIS — {symbol}</b>\n\n"
+                        f"📍 Chain: <b>{chain.upper()}</b> | DEX: <b>{dex}</b>\n"
+                        f"💰 Price: <b>${price}</b> ({change24h:+.2f}%)\n"
+                        f"💧 Liquidity: <b>${liquidity:,.0f}</b>\n"
+                        f"📊 Volume 24H: <b>${volume24h:,.0f}</b>\n"
+                        f"🔄 Buys/Sells: <b>{buys}/{sells}</b>\n\n"
+                        f"{emoji} <b>Signal: {a['signal']}</b> ({a.get('confidence')}% confidence)\n"
+                        f"{risk_color} Risk: <b>{a['risk']}</b>\n\n"
+                        f"📝 {a.get('reasoning','')}\n"
+                        f"⚠️ {a.get('caution','')}\n\n"
+                        f"🎯 Entry: {a.get('entry','—')} | TP: {a.get('target','—')} | SL: {a.get('stop','—')}\n\n"
+                        f"<i>⚠️ NOT FINANCIAL ADVICE. DYOR on new tokens.</i>"
+                    )
+                    tg(msg)
+                except Exception as e:
+                    log.error(f"CA scan error: {e}")
+                    tg(f"❌ CA scan failed: {str(e)[:150]}")
+            threading.Thread(target=scan_ca, args=(ca,), daemon=True).start()
 
     # Handle close confirm
     if "callback_query" in update:
         cb = update["callback_query"]
         data = cb.get("data","")
-        if data == "close_yes" and bot_state["waiting_for"] == "close_confirm":
-            pos = bot_state["active_position"]
-            success = close_position(pos["symbol"])
-            if success:
-                tg(f"✅ <b>{pos['symbol']}</b> position closed.")
-                bot_state["active_position"] = None
-            else:
-                tg("❌ Failed to close position. Check Hyperliquid manually.")
-            bot_state["waiting_for"] = None
+        if data.startswith("close_") and data != "close_no" and bot_state["waiting_for"] == "close_confirm":
+            symbol = data.replace("close_","")
+            def do_close(symbol):
+                success = close_position(symbol)
+                if success:
+                    tg(f"✅ <b>{symbol}</b> position closed successfully.")
+                    bot_state["active_position"] = None
+                else:
+                    tg(f"❌ Failed to close {symbol}. Try manually on Hyperliquid.")
+                bot_state["waiting_for"] = None
+            threading.Thread(target=do_close, args=(symbol,), daemon=True).start()
+            tg(f"⏳ Closing <b>{symbol}</b>...")
         elif data == "close_no" and bot_state["waiting_for"] == "close_confirm":
             bot_state["waiting_for"] = None
             tg("Position kept open.")
@@ -1172,3 +1326,4 @@ if __name__ == '__main__':
     tg("🤖 <b>CIPHER BOT ONLINE</b>\n\nType /start for commands.\nType /scan to scan for setups.")
     port = int(os.environ.get("PORT", 5001))
     app.run(host='0.0.0.0', port=port, debug=False)
+
